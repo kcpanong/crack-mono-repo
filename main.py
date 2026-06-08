@@ -1,6 +1,7 @@
 import os
 import cv2
 import boto3
+import json
 import torch
 import requests
 import tempfile
@@ -107,8 +108,12 @@ print(
 
 if not firebase_admin._apps:
 
+    firebase_json = os.environ.get(
+        "FIREBASE_SERVICE_ACCOUNT"
+    )
+
     cred = credentials.Certificate(
-        SERVICE_ACCOUNT_FILE
+        json.loads(firebase_json)
     )
 
     firebase_admin.initialize_app(

@@ -1,25 +1,54 @@
 import os
 import cv2
+import boto3
 import torch
+import requests
+import tempfile
+import firebase_admin
 import torch.nn as nn
 import numpy as np
 
 from PIL import Image
 from torchvision import transforms
 
-# ==========================================
-# CONFIG
-# ==========================================
+from firebase_admin import (
+    credentials,
+    firestore
+)
 
-INPUT_FOLDER = "downloads"
+# ==========================================================
+# 1. CONFIG
+# ==========================================================
 
-MODEL_PATH = "crack_seg_cnn.pth"
+SERVICE_ACCOUNT_FILE = (
+    "serviceAccountKey.json"
+)
+
+MODEL_PATH = (
+    "crack_seg_cnn.pth"
+)
+
+IDENTITY_POOL_ID = (
+    "ap-southeast-2:e70f96d9-6860-4f80-9bf8-082d2661b665"
+)
+
+REGION = (
+    "ap-southeast-2"
+)
+
+BUCKET_NAME = (
+    "my-angular-test-bucket-12345"
+)
 
 IMG_SIZE = 416
 
-MASK_FOLDER = "masks"
-OVERLAY_FOLDER = "overlays"
-PROB_FOLDER = "probabilities"
+TEMP_DOWNLOAD_FOLDER = (
+    "temp_downloads"
+)
+
+TEMP_MASK_FOLDER = (
+    "temp_masks"
+)
 
 DEVICE = torch.device(
     "cuda"
@@ -27,9 +56,39 @@ DEVICE = torch.device(
     else "cpu"
 )
 
-# ==========================================
-# MODEL
-# ==========================================
+# ==========================================================
+# 2. FIREBASE INIT
+# ==========================================================
+
+if not firebase_admin._apps:
+
+    cred = credentials.Certificate(
+        SERVICE_ACCOUNT_FILE
+    )
+
+    firebase_admin.initialize_app(
+        cred
+    )
+
+db = firestore.client()
+
+# ==========================================================
+# 3. TEMP FOLDERS
+# ==========================================================
+
+os.makedirs(
+    TEMP_DOWNLOAD_FOLDER,
+    exist_ok=True
+)
+
+os.makedirs(
+    TEMP_MASK_FOLDER,
+    exist_ok=True
+)
+
+# ==========================================================
+# 4. MODEL
+# ==========================================================
 
 class CrackSegCNN(nn.Module):
 
@@ -144,9 +203,9 @@ class CrackSegCNN(nn.Module):
 
         return torch.sigmoid(x)
 
-# ==========================================
-# TRANSFORM
-# ==========================================
+# ==========================================================
+# 5. TRANSFORM
+# ==========================================================
 
 transform = transforms.Compose([
     transforms.ToTensor(),
@@ -156,32 +215,15 @@ transform = transforms.Compose([
     )
 ])
 
-# ==========================================
-# CREATE OUTPUT FOLDERS
-# ==========================================
-
-os.makedirs(
-    MASK_FOLDER,
-    exist_ok=True
-)
-
-os.makedirs(
-    OVERLAY_FOLDER,
-    exist_ok=True
-)
-
-os.makedirs(
-    PROB_FOLDER,
-    exist_ok=True
-)
-
-# ==========================================
-# LOAD MODEL
-# ==========================================
+# ==========================================================
+# 6. LOAD MODEL
+# ==========================================================
 
 print("\nLoading model...")
 
-model = CrackSegCNN().to(DEVICE)
+model = CrackSegCNN().to(
+    DEVICE
+)
 
 model.load_state_dict(
     torch.load(
@@ -196,68 +238,182 @@ print(
     f"Model loaded on {DEVICE}"
 )
 
-# ==========================================
-# GET IMAGES
-# ==========================================
+# ==========================================================
+# 7. GET AWS TEMP CREDS
+# ==========================================================
 
-image_files = [
+print(
+    "\nGetting Cognito credentials..."
+)
 
-    f
+identity_client = boto3.client(
+    "cognito-identity",
+    region_name=REGION
+)
 
-    for f in os.listdir(
-        INPUT_FOLDER
+identity = identity_client.get_id(
+    IdentityPoolId=IDENTITY_POOL_ID
+)
+
+identity_id = identity[
+    "IdentityId"
+]
+
+creds_response = (
+    identity_client.get_credentials_for_identity(
+        IdentityId=identity_id
     )
+)
 
-    if f.lower().endswith(
-        (
-            ".jpg",
-            ".jpeg",
-            ".png"
-        )
-    )
-
+creds = creds_response[
+    "Credentials"
 ]
 
 print(
-    f"\nFound "
-    f"{len(image_files)} "
-    f"images."
+    "Temporary credentials acquired."
 )
 
-# ==========================================
-# PROCESS IMAGES
-# ==========================================
+s3 = boto3.client(
+    "s3",
+    region_name=REGION,
+    aws_access_key_id=creds[
+        "AccessKeyId"
+    ],
+    aws_secret_access_key=creds[
+        "SecretKey"
+    ],
+    aws_session_token=creds[
+        "SessionToken"
+    ]
+)
 
-for idx, filename in enumerate(
-    image_files,
-    start=1
+# ==========================================================
+# 8. FIRESTORE QUERY
+# ==========================================================
+
+def get_unprocessed_crops():
+
+    docs = (
+        db.collection("images")
+        .where(
+            "type",
+            "==",
+            "cropped"
+        )
+        .stream()
+    )
+
+    results = []
+
+    for doc in docs:
+
+        data = doc.to_dict()
+
+        if data.get(
+            "retrievedForProcessing",
+            False
+        ):
+            continue
+
+        if not data.get(
+            "storageUrl"
+        ):
+            continue
+
+        results.append({
+
+            "doc_ref":
+                doc.reference,
+
+            "sessionId":
+                data.get(
+                    "sessionId"
+                ),
+
+            "cropped_id":
+                data.get(
+                    "cropped_id"
+                ),
+
+            "filename":
+                data.get(
+                    "filename"
+                ),
+
+            "storageUrl":
+                data.get(
+                    "storageUrl"
+                )
+        })
+
+    return results
+
+# ==========================================================
+# 9. DOWNLOAD
+# ==========================================================
+
+def sanitize_filename(
+    filename
 ):
 
-    print(
-        f"\n[{idx}/{len(image_files)}] "
-        f"{filename}"
+    bad_chars = (
+        ':',
+        '/',
+        '\\',
+        '*',
+        '?',
+        '"',
+        '<',
+        '>',
+        '|'
     )
 
-    image_path = os.path.join(
-        INPUT_FOLDER,
-        filename
-    )
+    for char in bad_chars:
 
-    original = cv2.imread(
-        image_path
-    )
-
-    if original is None:
-
-        print(
-            "Failed to load image."
+        filename = (
+            filename.replace(
+                char,
+                "_"
+            )
         )
 
-        continue
+    return filename
+
+def download_image(
+    url,
+    output_path
+):
+
+    response = requests.get(
+        url,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    with open(
+        output_path,
+        "wb"
+    ) as f:
+
+        f.write(
+            response.content
+        )
+
+# ==========================================================
+# 10. SEGMENT
+# ==========================================================
+
+def create_mask(
+    image_path,
+    output_mask_path
+):
 
     image = Image.open(
         image_path
-    ).convert("RGB")
+    ).convert(
+        "RGB"
+    )
 
     image = image.resize(
         (
@@ -266,13 +422,13 @@ for idx, filename in enumerate(
         )
     )
 
-    tensor = transform(
-        image
-    ).unsqueeze(0).to(DEVICE)
-
-    # ======================================
-    # INFERENCE
-    # ======================================
+    tensor = (
+        transform(
+            image
+        )
+        .unsqueeze(0)
+        .to(DEVICE)
+    )
 
     with torch.no_grad():
 
@@ -286,95 +442,194 @@ for idx, filename in enumerate(
         .numpy()
     )
 
-    base_name = os.path.splitext(
-        filename
-    )[0]
-
-    prob_path = os.path.join(
-        PROB_FOLDER,
-        f"{base_name}.csv"
-    )
-
-    mask_path = os.path.join(
-        MASK_FOLDER,
-        f"{base_name}_mask.png"
-    )
-
-    overlay_path = os.path.join(
-        OVERLAY_FOLDER,
-        f"{base_name}_overlay.png"
-    )
-
-    # ======================================
-    # SAVE PROBABILITIES
-    # ======================================
-
-    np.savetxt(
-        prob_path,
-        prob_map,
-        delimiter=",",
-        fmt="%.6f"
-    )
-
-    # ======================================
-    # CREATE MASK
-    # ======================================
-
     mask = (
         prob_map >= 0.5
-    ).astype(np.uint8) * 255
+    ).astype(
+        np.uint8
+    ) * 255
 
     cv2.imwrite(
-        mask_path,
+        output_mask_path,
         mask
     )
 
-    # ======================================
-    # CREATE OVERLAY
-    # ======================================
+# ==========================================================
+# 11. S3 UPLOAD
+# ==========================================================
 
-    overlay_mask = cv2.resize(
-        mask,
-        (
-            original.shape[1],
-            original.shape[0]
+def upload_mask(
+    mask_path,
+    session_id,
+    cropped_id
+):
+
+    s3_key = (
+        f"masks/"
+        f"{session_id}/"
+        f"{cropped_id}_mask.png"
+    )
+
+    s3.upload_file(
+        mask_path,
+        BUCKET_NAME,
+        s3_key
+    )
+
+    url = (
+        f"https://{BUCKET_NAME}"
+        f".s3.{REGION}.amazonaws.com/"
+        f"{s3_key}"
+    )
+
+    return (
+        s3_key,
+        url
+    )
+
+# ==========================================================
+# 12. UPDATE FIRESTORE
+# ==========================================================
+
+def mark_processed(
+    doc_ref,
+    mask_key,
+    mask_url
+):
+
+    doc_ref.update({
+
+        "maskS3Key":
+            mask_key,
+
+        "maskS3Url":
+            mask_url,
+
+        "retrievedForProcessing":
+            True,
+
+        "processedAt":
+            firestore.SERVER_TIMESTAMP
+    })
+
+# ==========================================================
+# 13. MAIN
+# ==========================================================
+
+if __name__ == "__main__":
+
+    crops = (
+        get_unprocessed_crops()
+    )
+
+    print(
+        f"\nFound "
+        f"{len(crops)} "
+        f"crops to process.\n"
+    )
+
+    success_count = 0
+
+    for index, crop in enumerate(
+        crops,
+        start=1
+    ):
+
+        print(
+            f"\n[{index}/{len(crops)}]"
         )
-    )
 
-    overlay_mask = cv2.cvtColor(
-        overlay_mask,
-        cv2.COLOR_GRAY2BGR
-    )
+        try:
 
-    overlay = cv2.addWeighted(
-        original,
-        0.7,
-        overlay_mask,
-        0.3,
-        0
-    )
+            safe_filename = (
+                sanitize_filename(
+                    crop["filename"]
+                )
+            )
 
-    cv2.imwrite(
-        overlay_path,
-        overlay
+            local_image = os.path.join(
+                TEMP_DOWNLOAD_FOLDER,
+                safe_filename
+            )
+
+            local_mask = os.path.join(
+                TEMP_MASK_FOLDER,
+                (
+                    crop["cropped_id"]
+                    + "_mask.png"
+                )
+            )
+
+            print(
+                "Downloading..."
+            )
+
+            download_image(
+                crop["storageUrl"],
+                local_image
+            )
+
+            print(
+                "Running segmentation..."
+            )
+
+            create_mask(
+                local_image,
+                local_mask
+            )
+
+            print(
+                "Uploading mask..."
+            )
+
+            (
+                mask_key,
+                mask_url
+            ) = upload_mask(
+
+                local_mask,
+
+                crop[
+                    "sessionId"
+                ],
+
+                crop[
+                    "cropped_id"
+                ]
+            )
+
+            print(
+                "Updating Firestore..."
+            )
+
+            mark_processed(
+
+                crop[
+                    "doc_ref"
+                ],
+
+                mask_key,
+
+                mask_url
+            )
+
+            success_count += 1
+
+            print(
+                "SUCCESS"
+            )
+
+        except Exception as e:
+
+            print(
+                f"FAILED: {e}"
+            )
+
+    print(
+        "\nFinished."
     )
 
     print(
-        f"Saved mask: {mask_path}"
+        f"Processed "
+        f"{success_count} / "
+        f"{len(crops)} images."
     )
-
-    print(
-        f"Saved overlay: {overlay_path}"
-    )
-
-    print(
-        f"Saved probabilities: {prob_path}"
-    )
-
-# ==========================================
-# DONE
-# ==========================================
-
-print(
-    "\nAll images processed."
-)

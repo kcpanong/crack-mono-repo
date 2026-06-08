@@ -512,10 +512,10 @@ def mark_processed(
     })
 
 # ==========================================================
-# 13. MAIN
+# 13. PROCESS PIPELINE
 # ==========================================================
 
-if __name__ == "__main__":
+def process_all_crops():
 
     crops = (
         get_unprocessed_crops()
@@ -527,7 +527,7 @@ if __name__ == "__main__":
         f"crops to process.\n"
     )
 
-    success_count = 0
+    processed_count = 0
 
     for index, crop in enumerate(
         crops,
@@ -612,7 +612,7 @@ if __name__ == "__main__":
                 mask_url
             )
 
-            success_count += 1
+            processed_count += 1
 
             print(
                 "SUCCESS"
@@ -624,12 +624,29 @@ if __name__ == "__main__":
                 f"FAILED: {e}"
             )
 
+    result = {
+
+        "processed":
+            processed_count,
+
+        "total":
+            len(crops)
+
+    }
+
     print(
         "\nFinished."
     )
 
-    print(
-        f"Processed "
-        f"{success_count} / "
-        f"{len(crops)} images."
-    )
+    print(result)
+
+    return result
+
+
+# ==========================================================
+# 14. LOCAL EXECUTION
+# ==========================================================
+
+if __name__ == "__main__":
+
+    process_all_crops()

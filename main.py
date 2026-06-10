@@ -371,10 +371,23 @@ def create_mask(
     )
 
     mask = (
-        prob_map >= 0.5
+        prob_map >= 0.3
     ).astype(
         np.uint8
-    ) * 255
+    )
+
+    kernel = np.ones(
+        (7, 7),
+        np.uint8
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+    mask = mask * 255
 
     cv2.imwrite(
         output_mask_path,

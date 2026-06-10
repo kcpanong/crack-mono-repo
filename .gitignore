@@ -4,8 +4,13 @@ __pycache__/
 
 temp_downloads/
 temp_masks/
+training_data/
 
 .env
 
 .idea/
 .vscode/
+
+serviceAccountKey.json
+local_version.py
+data_extractor.py

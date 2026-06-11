@@ -1,7 +1,11 @@
 from fastapi import FastAPI
 
-from main import (
+from services.mask_generation import (
     process_all_images
+)
+
+from services.image_capture import (
+    app as image_capture_app
 )
 
 app = FastAPI()
@@ -26,3 +30,8 @@ def process_all():
         "result":
             result
     }
+
+app.mount(
+    "/capture",
+    image_capture_app
+)

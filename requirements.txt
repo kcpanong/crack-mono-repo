@@ -1,9 +1,22 @@
-onnxruntime
-opencv-python-headless
-numpy
-Pillow
-firebase-admin
-requests
-boto3
 fastapi
 uvicorn
+numpy
+Pillow
+
+# Computer Vision
+opencv-python-headless
+opencv-contrib-python-headless
+
+# Machine Learning / Inference
+onnxruntime
+scipy
+
+# API / File Uploads
+python-multipart
+
+# Cloud / Storage
+firebase-admin
+boto3
+
+# HTTP Requests
+requests

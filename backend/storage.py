@@ -10,6 +10,7 @@ from fastapi import UploadFile
 import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime, timezone
+import time
 
 STORAGE_MODE = os.environ.get("STORAGE_MODE", "LOCAL")
 LOCAL_STORAGE_DIR = "storage"
@@ -218,6 +219,19 @@ class InspectionRepository:
     
     @staticmethod
     def process_cloud_session_images(original_id: str, original_url: str, resized_url: str) -> dict:
+        # If an assessment already exists for this original, skip calling the external AI
+        # and the CV analysis — return the saved assessment content instead.
+        assessment_id = f"img_{original_id}"
+        try:
+            if InspectionRepository.assessment_exists(assessment_id):
+                print(f"Assessment {assessment_id} already exists; loading and skipping CV work.")
+                existing = InspectionRepository.load_assessment_record(assessment_id)
+                mask_url = existing.get("masks3Url") or existing.get("masks3_url") or existing.get("masks_url") or existing.get("mask_url")
+                crack_data = existing.get("crack_data") or {"bounding_boxes": [], "contours": []}
+                return {"mask_url": mask_url, "crack_data": crack_data}
+        except Exception as e:
+            print(f"assessment existence check failed: {e}")
+
         external_api_url = MASK_API_URL
 
         headers = {
@@ -527,3 +541,47 @@ class InspectionRepository:
             raise
 
         return assessment_payload
+
+    @staticmethod
+    def assessment_exists(assessment_id: str) -> bool:
+        """Return True if an assessment record exists in the configured storage."""
+        if not assessment_id:
+            return False
+
+        if STORAGE_MODE == "CLOUD":
+            try:
+                db = firestore.client()
+                doc = db.collection("assessments").document(assessment_id).get()
+                return doc.exists
+            except Exception as e:
+                print(f"Failed to check assessment existence in cloud: {e}")
+                return False
+
+        # LOCAL mode: check for a file named storage/<assessment_id>.json
+        try:
+            path = os.path.join(LOCAL_STORAGE_DIR, f"{assessment_id}.json")
+            return os.path.exists(path)
+        except Exception as e:
+            print(f"Failed to check local assessment existence: {e}")
+            return False
+
+    @staticmethod
+    def load_assessment_record(assessment_id: str) -> dict:
+        """Load and return an assessment record from storage. Raises on failure."""
+        if not assessment_id:
+            return {}
+
+        if STORAGE_MODE == "CLOUD":
+            db = firestore.client()
+            doc = db.collection("assessments").document(assessment_id).get()
+            if not doc.exists:
+                raise FileNotFoundError(f"Assessment {assessment_id} not found in Firestore")
+            return doc.to_dict()
+
+        # LOCAL: read JSON file
+        path = os.path.join(LOCAL_STORAGE_DIR, f"{assessment_id}.json")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Local assessment file not found: {path}")
+
+        with open(path, "r") as f:
+            return json.load(f)

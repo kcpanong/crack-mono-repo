@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, File, UploadFile, Request, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from storage import InspectionRepository
+from backend.storage import InspectionRepository
 
 app = FastAPI()
 

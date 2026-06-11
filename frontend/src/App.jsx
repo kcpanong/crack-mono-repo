@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Upload, Columns, Square, Folder } from 'lucide-react';
 
 const INITIAL_DIRECTORY = [];
-const API_BASE = import.meta.env.VITE_APP_URL || '';
+const API_BASE = import.meta.env.VITE_APP_URL || 'https://crack-mono-repo.onrender.com';
 const MASK_API = import.meta.env.VITE_MASK_API_URL || `${API_BASE}/api/analyze-session`;
 
 export default function App() {
@@ -104,6 +104,19 @@ export default function App() {
     const fetchDirectoryHistory = async () => {
       try {
         const res = await fetch(`${API_BASE}/api/inspections`);
+        if (!res.ok) {
+          const txt = await res.text();
+          console.error(`Inspections fetch failed: ${res.status} ${res.statusText}`, txt);
+          return;
+        }
+
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          const txt = await res.text();
+          console.error('Inspections endpoint did not return JSON:', txt.slice(0, 200));
+          return;
+        }
+
         const json = await res.json();
         if (json && json.length > 0) {
           setInspections(json);

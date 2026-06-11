@@ -9,6 +9,7 @@ from scipy import stats
 from fastapi import UploadFile
 import firebase_admin
 from firebase_admin import credentials, firestore
+from datetime import datetime, timezone
 
 STORAGE_MODE = os.environ.get("STORAGE_MODE", "LOCAL")
 LOCAL_STORAGE_DIR = "storage"
@@ -201,7 +202,7 @@ class InspectionRepository:
     @staticmethod
     def process_cloud_session_images(original_id: str, original_url: str, resized_url: str) -> dict:
         external_api_url = MASK_API_URL
-        
+
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
@@ -213,13 +214,99 @@ class InspectionRepository:
             "resized_url": str(resized_url)
         }
 
-        print(f"Triggering background batch process via: {external_api_url}")
+        print(f"Calling external AI service at: {external_api_url}")
 
         try:
-            api_response = requests.post(external_api_url, json=payload, headers=headers, timeout=15)
-            print(f"AI Batch Service Initial Response Status: {api_response.status_code}")
+            api_response = requests.post(external_api_url, json=payload, headers=headers, timeout=30)
+            api_response.raise_for_status()
+
+            try:
+                resp_json = api_response.json()
+            except Exception:
+                print("External AI service returned non-JSON response.")
+                resp_json = {}
+
+            # Normalize common response keys
+            mask_url = resp_json.get("mask_url") or resp_json.get("maskUrl") or resp_json.get("mask")
+            crack_data = resp_json.get("crack_data") or resp_json.get("crackData") or resp_json.get("results")
+
+            if crack_data is None:
+                # If external service returned pixel/mask bytes or a URL, we don't attempt to process here.
+                crack_data = {"bounding_boxes": [], "contours": []}
+
+            print(f"External AI Service responded. mask_url={mask_url is not None}, crack_data_present={bool(crack_data and crack_data.get('bounding_boxes'))}")
+
+            # Build lightweight assessment record to persist
+            assessment = {
+                "id": f"img_{original_id}",
+                "sessionId": None,
+                "type": "original",
+                "name": os.path.basename(original_url) if original_url else None,
+                "storageUrl": original_url,
+                "masks3Url": mask_url,
+                "is_assessed": True,
+                "assessed_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                "crack_data": {
+                    "assessment": {},
+                    "bounding_boxes": crack_data.get("bounding_boxes", []) if isinstance(crack_data, dict) else [],
+                    "contours": crack_data.get("contours", []) if isinstance(crack_data, dict) else []
+                }
+            }
+
+            # Compute macro stats if bounding boxes exist
+            try:
+                boxes = assessment["crack_data"]["bounding_boxes"]
+                num = len(boxes)
+                if num > 0:
+                    lengths = []
+                    widths = []
+                    orientations = []
+                    for b in boxes:
+                        # parse e.g. "14.20 mm"
+                        try:
+                            lengths.append(float(str(b.get("crackLength","0")).split()[0]))
+                        except Exception:
+                            lengths.append(0.0)
+                        try:
+                            widths.append(float(str(b.get("avgWidth","0")).split()[0]))
+                        except Exception:
+                            widths.append(0.0)
+                        if b.get("orientation"):
+                            orientations.append(b.get("orientation"))
+
+                    macro_stats = {
+                        "number_of_cracks": num,
+                        "average_length_mm": float(np.mean(lengths)) if len(lengths) > 0 else 0.0,
+                        "average_width_mm": float(np.mean(widths)) if len(widths) > 0 else 0.0,
+                        "max_width_mm": float(np.max(widths)) if len(widths) > 0 else 0.0,
+                        "most_common_orientation": (max(set(orientations), key=orientations.count) if orientations else "unknown")
+                    }
+                    assessment["crack_data"]["assessment"]["macro_stats"] = macro_stats
+                else:
+                    assessment["crack_data"]["assessment"]["macro_stats"] = {
+                        "number_of_cracks": 0,
+                        "average_length_mm": 0.0,
+                        "average_width_mm": 0.0,
+                        "max_width_mm": 0.0,
+                        "most_common_orientation": "unknown"
+                    }
+            except Exception as e:
+                print(f"Failed computing macro stats: {e}")
+
+            # Persist assessment
+            try:
+                InspectionRepository.save_assessment_record(assessment)
+            except Exception as e:
+                print(f"Failed to save assessment record: {e}")
+
+            return {
+                "mask_url": mask_url,
+                "crack_data": crack_data
+            }
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to call external AI service: {e}")
         except Exception as e:
-            print(f"AI Service Wakeup notice sent. (Handled error/timeout): {e}")
+            print(f"Unexpected error calling external AI service: {e}")
 
         return {
             "mask_url": None,
@@ -393,3 +480,33 @@ class InspectionRepository:
                     originals_map[parent_id]["resized_variants"].append(r_img)
             
             return list(sessions_map.values())
+
+    @staticmethod
+    def save_assessment_record(assessment_payload: dict) -> dict:
+        """Persist an assessment record to Firestore (CLOUD) or local JSON file (LOCAL)."""
+        if STORAGE_MODE == "CLOUD":
+            try:
+                db = firestore.client()
+                coll = db.collection("assessments")
+                doc_id = assessment_payload.get("id") or coll.document().id
+                coll.document(doc_id).set(assessment_payload)
+                print(f"Saved assessment to Firestore with id={doc_id}")
+                return assessment_payload
+            except Exception as e:
+                print(f"Failed to write assessment to Firestore: {e}")
+                raise
+
+        # LOCAL fallback: write JSON to storage/<assessment_id>.json
+        folder = LOCAL_STORAGE_DIR
+        os.makedirs(folder, exist_ok=True)
+        aid = assessment_payload.get("id") or f"assessment_{int(time.time())}"
+        out_path = os.path.join(folder, f"{aid}.json")
+        try:
+            with open(out_path, "w") as f:
+                json.dump(assessment_payload, f)
+            print(f"Saved assessment locally to {out_path}")
+        except Exception as e:
+            print(f"Failed to save local assessment: {e}")
+            raise
+
+        return assessment_payload

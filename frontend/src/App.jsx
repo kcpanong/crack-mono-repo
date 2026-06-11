@@ -2,6 +2,8 @@ import { useState, useRef, useEffect } from 'react';
 import { Upload, Columns, Square, Folder } from 'lucide-react';
 
 const INITIAL_DIRECTORY = [];
+const API_BASE = import.meta.env.VITE_APP_URL || '';
+const MASK_API = import.meta.env.VITE_MASK_API_URL || `${API_BASE}/api/analyze-session`;
 
 export default function App() {
   const [loading, setLoading] = useState(false);
@@ -52,7 +54,7 @@ export default function App() {
     formData.append("file", file);
 
     try {
-      const res = await fetch(`${import.meta.env.VITE_APP_URL}/api/upload`, {
+      const res = await fetch(`${API_BASE}/api/upload`, {
         method: "POST",
         body: formData
       });
@@ -75,7 +77,9 @@ export default function App() {
 
     setLoading(true);
     try {
-      const res = await fetch(`${import.meta.env.VITE_APP_URL}/api/analyze-session`, {
+      // Force frontend -> backend orchestration. Backend will call the external
+      // DAMAGE_MASK_API_URL (if configured) and return processed data.
+      const res = await fetch(`${API_BASE}/api/analyze-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(session)
@@ -98,7 +102,7 @@ export default function App() {
   useEffect(() => {
     const fetchDirectoryHistory = async () => {
       try {
-        const res = await fetch(`${import.meta.env.VITE_APP_URL}/api/inspections`);
+        const res = await fetch(`${API_BASE}/api/inspections`);
         const json = await res.json();
         if (json && json.length > 0) {
           setInspections(json);
@@ -110,6 +114,100 @@ export default function App() {
     fetchDirectoryHistory();
   }, []);
 
+  // Session summary state and helpers (moved outside JSX)
+  const [sessionSummaryText, setSessionSummaryText] = useState(null);
+
+  const getOrientationLabel = (orientation) => {
+    if (!orientation) return 'N/A';
+    const s = String(orientation);
+    if (/curve/i.test(s)) return `Curve (${s})`;
+    const m = s.match(/(-?\d+(?:\.\d+)?)/);
+    if (!m) return s;
+    const deg = parseFloat(m[1]);
+    if (Number.isNaN(deg)) return s;
+    // Normalize to [0,180)
+    const norm = ((deg % 180) + 180) % 180;
+    const near = (target, tol = 15) => Math.abs(norm - target) <= tol;
+    let label = 'Diagonal';
+    if (near(0) || near(180)) label = 'Horizontal';
+    else if (near(90)) label = 'Vertical';
+    return `${label} (${deg.toFixed(1)}°)`;
+  };
+
+  const handleCreateAssessment = async (session, original) => {
+    if (!session || !original) return;
+    setLoading(true);
+    try {
+      const payload = {
+        id: `img_${original.id}`,
+        sessionId: session.sessionId,
+        type: original.type || 'original',
+        name: original.name || `img_${original.id}`,
+        storageUrl: original.url,
+        masks3Url: original.mask_url || null,
+        is_assessed: true,
+        assessed_at: new Date().toISOString(),
+        crack_data: {
+          bounding_boxes: original.crack_data?.bounding_boxes || [],
+          contours: original.crack_data?.contours || []
+        }
+      };
+
+      const res = await fetch(`${API_BASE}/api/assessments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const saved = await res.json();
+
+      // update local state: attach assessment to the original
+      setInspections(prev => prev.map(s => {
+        if (s.sessionId !== session.sessionId) return s;
+        return {
+          ...s,
+          originals: s.originals.map(o => o.id === original.id ? { ...o, crack_data: { ...(o.crack_data||{}), assessment: saved.crack_data?.assessment || {} } } : o)
+        };
+      }));
+    } catch (e) {
+      console.error('Failed to create assessment', e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const generateSessionSummary = () => {
+    if (!activeSession) return;
+    const counts = { remedial: 0, months_1_2: 0, not_safe: 0 };
+    const allBoxes = [];
+    activeSession.originals?.forEach(o => {
+      (o.crack_data?.bounding_boxes || []).forEach(b => allBoxes.push(b));
+    });
+
+    allBoxes.forEach(b => {
+      const len = parseFloat(String(b.crackLength || '').split(' ')[0]) || 0;
+      if (len > 20) counts.not_safe += 1;
+      else if (len > 15) counts.months_1_2 += 1;
+      else if (len > 10) counts.remedial += 1;
+    });
+
+    let message = 'No major cracks detected in this session.';
+    if (counts.not_safe > 0) {
+      message = `Warning: ${counts.not_safe} crack(s) exceed 2.0 cm — immediate professional evaluation recommended.`;
+    } else if (counts.months_1_2 > 0) {
+      message = `Notice: ${counts.months_1_2} crack(s) exceed 1.5 cm — consider repair within 1-2 months.`;
+    } else if (counts.remedial > 0) {
+      message = `Advisory: ${counts.remedial} crack(s) exceed 1.0 cm — remedial action recommended.`;
+    }
+
+    // Add a contextual natural language closing sentence
+    if (counts.not_safe + counts.months_1_2 + counts.remedial > 0) {
+      message += ' Based on the number of cracks at this level, please seek help from a professional before it\'s too late.';
+    }
+
+    setSessionSummaryText(message);
+  };
+
   return (
     <div style={{ fontFamily: 'sans-serif', backgroundColor: '#0f172a', color: '#f8fafc', minHeight: '100vh', padding: '20px', display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #334155', paddingBottom: '15px', marginBottom: '20px' }}>
@@ -118,21 +216,35 @@ export default function App() {
         </div>
 
         <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#2563eb', padding: '8px 16px', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          <button
+            title="Upload disabled in this build"
+            style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#334155', border: '1px solid #475569', color: '#fff', padding: '8px 16px', borderRadius: '6px', cursor: 'not-allowed' }}
+            disabled
+          >
             <Upload size={18} />
-            {loading ? 'Processing...' : 'Upload Photo'}
-            <input type="file" accept="image/*" onChange={handleFileUpload} hidden disabled={loading} />
-          </label>
+            Upload Disabled
+          </button>
 
           {inspections.length > 0 && (
-            <button
-              onClick={() => setIsDualWindow(!isDualWindow)}
-              style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#334155', border: '1px solid #475569', color: '#fff', padding: '8px 16px', borderRadius: '6px', cursor: 'pointer' }}
-            >
-              {isDualWindow ? <Square size={18} /> : <Columns size={18} />}
-              {isDualWindow ? 'Single Window' : 'Compare Side-by-Side'}
-            </button>
+            <>
+              <button
+                onClick={() => setIsDualWindow(!isDualWindow)}
+                style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#334155', border: '1px solid #475569', color: '#fff', padding: '8px 12px', borderRadius: '6px', cursor: 'pointer' }}
+              >
+                {isDualWindow ? <Square size={18} /> : <Columns size={18} />}
+                {isDualWindow ? 'Single Window' : 'Compare Side-by-Side'}
+              </button>
+
+              <button
+                onClick={() => generateSessionSummary()}
+                style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#064e3b', border: '1px solid #065f46', color: '#fff', padding: '8px 12px', borderRadius: '6px', cursor: 'pointer' }}
+              >
+                Session Summary
+              </button>
+            </>
           )}
+
+          
         </div>
       </header>
 
@@ -231,41 +343,49 @@ export default function App() {
             </>
           ) : (
             <div style={{ display: 'flex', flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#090d16', color: '#64748b', gridColumn: '1 / -1', height: '100%' }}>
-              No inspections loaded. Upload a structural photo to initialize the workspace grids.
+              No inspections loaded. Use the backend or import a session to populate inspections.
             </div>
           )}
         </main>
 
-        <aside style={{ width: '280px', borderLeft: '1px solid #334155', backgroundColor: '#0f172a', padding: '15px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+        <aside style={{ width: '320px', borderLeft: '1px solid #334155', backgroundColor: '#0f172a', padding: '15px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
           <div>
-            <h3 style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: '#64748b', letterSpacing: '0.05em', margin: '0 0 15px 0' }}>Macro Asset Analysis</h3>
+            <h3 style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: '#64748b', letterSpacing: '0.05em', margin: '0 0 12px 0' }}>Assessment Summary</h3>
 
             {activeInspection ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
-                <div style={{ backgroundColor: '#1e293b', padding: '12px', borderRadius: '6px', border: '1px solid #334155' }}>
-                  <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '4px', textTransform: 'uppercase' }}>Total Length Gained</div>
-                  <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#38bdf8' }}>{macroStats.totalLength}</div>
-                </div>
-
-                <div style={{ backgroundColor: '#1e293b', padding: '12px', borderRadius: '6px', border: '1px solid #334155' }}>
-                  <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '4px', textTransform: 'uppercase' }}>Average Cumulative Width</div>
-                  <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#38bdf8' }}>{macroStats.overallAvgWidth}</div>
-                </div>
-
-                <div style={{ backgroundColor: '#1e293b', padding: '12px', borderRadius: '6px', border: '1px solid #334155' }}>
-                  <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '4px', textTransform: 'uppercase' }}>Orientations Detected</div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                    {macroStats.orientations.map((ori, i) => (
-                      <span key={i} style={{ fontSize: '0.7rem', backgroundColor: '#334155', color: '#fff', padding: '3px 8px', borderRadius: '4px', border: '1px solid #475569' }}>
-                        {ori}
-                      </span>
-                    ))}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px' }}>
+                  <div style={{ flex: 1, backgroundColor: '#1e293b', padding: '12px', borderRadius: '6px', border: '1px solid #334155' }}>
+                    <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '4px', textTransform: 'uppercase' }}>Cracks</div>
+                    <div style={{ fontSize: '1.25rem', fontWeight: 'bold', color: '#38bdf8' }}>{(activeInspection.crack_data?.bounding_boxes || []).length}</div>
                   </div>
+                  <div style={{ width: '120px', backgroundColor: '#1e293b', padding: '12px', borderRadius: '6px', border: '1px solid #334155', textAlign: 'center' }}>
+                    <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '4px', textTransform: 'uppercase' }}>Severity</div>
+                    {(() => {
+                      const boxes = (activeInspection.crack_data?.bounding_boxes || []);
+                      let maxLen = 0;
+                      boxes.forEach(b => { const l = parseFloat(String(b.crackLength||'').split(' ')[0])||0; if (l>maxLen) maxLen = l; });
+                      if (maxLen > 20) return <div style={{ color: '#ef4444', fontWeight: '700' }}>Not Safe</div>;
+                      if (maxLen > 15) return <div style={{ color: '#f59e0b', fontWeight: '700' }}>1-2 Months</div>;
+                      if (maxLen > 10) return <div style={{ color: '#facc15', fontWeight: '700' }}>Remedial</div>;
+                      return <div style={{ color: '#10b981', fontWeight: '700' }}>Stable</div>;
+                    })()}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button onClick={() => handleCreateAssessment(activeSession, activeInspection)} style={{ flex: 1, backgroundColor: '#2563eb', color: '#fff', padding: '10px', borderRadius: '6px', border: 'none', cursor: 'pointer' }}>Save Assessment</button>
+                  <button onClick={() => generateSessionSummary()} style={{ backgroundColor: '#475569', color: '#fff', padding: '10px', borderRadius: '6px', border: 'none', cursor: 'pointer' }}>Generate Summary</button>
+                </div>
+
+                <div style={{ backgroundColor: '#0b1220', padding: '12px', borderRadius: '6px', border: '1px solid #1f2937' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Session Message</div>
+                  <div style={{ color: '#cbd5e1', fontSize: '0.9rem' }}>{sessionSummaryText || 'No summary generated yet. Click "Session Summary" to create one.'}</div>
                 </div>
               </div>
             ) : (
               <div style={{ textAlign: 'center', color: '#64748b', fontSize: '0.85rem', marginTop: '20px' }}>
-                Upload an image to compute structural statistics.
+                No inspection selected. Select a session and image to view assessment.
               </div>
             )}
           </div>
@@ -279,7 +399,7 @@ export default function App() {
             <p style={{ margin: '6px 0' }}><strong>Length:</strong> {activeCrack.crackLength}</p>
             <p style={{ margin: '6px 0' }}><strong>Avg. Width:</strong> {activeCrack.avgWidth}</p>
             <p style={{ margin: '6px 0' }}><strong>Max. Width:</strong> {activeCrack.maxWidth || "N/A"}</p>
-            <p style={{ margin: '6px 0' }}><strong>Orientation:</strong> {activeCrack.orientation || "N/A"}</p>
+            <p style={{ margin: '6px 0' }}><strong>Orientation:</strong> {getOrientationLabel(activeCrack.orientation) || "N/A"}</p>
             <button onClick={() => setActiveCrack(null)} style={{ marginTop: '12px', width: '100%', padding: '6px', backgroundColor: '#ef4444', border: 'none', color: '#fff', borderRadius: '4px', cursor: 'pointer' }}>Dismiss</button>
           </div>
         </div>

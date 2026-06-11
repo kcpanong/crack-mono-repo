@@ -66,6 +66,25 @@ async def analyze_session(payload: dict = Body(...)):
             orig["mask_url"] = result.get("mask_url")
             orig["crack_data"] = result.get("crack_data", {"bounding_boxes": [], "contours": []})
             orig["is_processed"] = True
+            # Create and persist assessment record (backend-owned)
+            try:
+                assessment_payload = {
+                    "id": f"img_{orig_id}",
+                    "sessionId": session_id,
+                    "type": orig.get("type", "original"),
+                    "name": orig.get("name"),
+                    "storageUrl": orig_url,
+                    "masks3Url": orig.get("mask_url") or result.get("mask_url"),
+                    "is_assessed": True,
+                    "assessed_at": None,
+                    "crack_data": {
+                        "bounding_boxes": orig["crack_data"].get("bounding_boxes", []),
+                        "contours": orig["crack_data"].get("contours", [])
+                    }
+                }
+                InspectionRepository.save_assessment_record(assessment_payload)
+            except Exception as e:
+                print(f"Failed to save assessment for orig {orig_id}: {e}")
         except Exception as e:
             print(f"Failed to process asset {orig_id}: {str(e)}")
             orig["is_processed"] = False
@@ -82,6 +101,19 @@ async def analyze_session(payload: dict = Body(...)):
         InspectionRepository.save_session_metadata(processed_session)
 
     return processed_session
+
+
+@app.post("/api/assessments")
+async def create_assessment(payload: dict = Body(...)):
+    """Accept an assessment payload and persist it without re-running CV pipelines."""
+    if not payload.get("id"):
+        raise HTTPException(status_code=400, detail="Missing assessment id")
+
+    try:
+        saved = InspectionRepository.save_assessment_record(payload)
+        return saved
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

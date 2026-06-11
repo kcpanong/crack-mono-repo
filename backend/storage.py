@@ -21,7 +21,7 @@ else:
 
 MASK_API_URL = os.environ.get(
     "DAMAGE_MASK_API_URL",
-    "https://github.com/kcpanong/crack-mono-repo.git"
+    "https://crack-mono-repo.onrender.com/analyze-session"
 )
 
 PIXEL_TO_MM = 0.1

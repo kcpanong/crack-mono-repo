@@ -1,4 +1,6 @@
-from fastapi import FastAPI
+from backend.main import (
+    app
+)
 
 from services.mask_generation import (
     process_all_images
@@ -7,8 +9,6 @@ from services.mask_generation import (
 from services.image_capture import (
     app as image_capture_app
 )
-
-app = FastAPI()
 
 @app.get("/")
 def root():
